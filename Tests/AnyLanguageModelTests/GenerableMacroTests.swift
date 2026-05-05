@@ -41,6 +41,18 @@ private struct ArrayItem {
 }
 
 @Generable
+private struct StructuredArrayItem {
+    var name: String
+    var count: Int
+}
+
+@Generable
+private struct StructuredArrayResponse {
+    var title: String
+    var items: [StructuredArrayItem]
+}
+
+@Generable
 private struct ArrayContainer {
     @Guide(description: "Items", .count(2))
     var items: [ArrayItem]
@@ -416,6 +428,26 @@ struct GenerableMacroTests {
         #expect(jsonString.contains("\"title\""))
         #expect(jsonString.contains("\"count\""))
         #expect(jsonString.contains("\"flag\""))
+    }
+
+    @Test("Array properties preserve generable item definitions")
+    func arrayPropertiesPreserveGenerableItemDefinitions() throws {
+        let schema = StructuredArrayResponse.generationSchema
+        let jsonData = try JSONEncoder().encode(schema)
+        let jsonObject = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+        let defs = jsonObject?["$defs"] as? [String: Any] ?? [:]
+
+        #expect(defs.keys.contains { $0.contains("StructuredArrayResponse") })
+        #expect(defs.keys.contains { $0.contains("StructuredArrayItem") })
+
+        let responseKey = defs.keys.first { $0.contains("StructuredArrayResponse") }
+        let responseDef = responseKey.flatMap { defs[$0] as? [String: Any] }
+        let properties = responseDef?["properties"] as? [String: Any]
+        let itemsProperty = properties?["items"] as? [String: Any]
+        let itemSchema = itemsProperty?["items"] as? [String: Any]
+        let itemRef = itemSchema?["$ref"] as? String
+
+        #expect(itemRef?.contains("StructuredArrayItem") == true)
     }
 
     @Test("Enum round-trip conversion")

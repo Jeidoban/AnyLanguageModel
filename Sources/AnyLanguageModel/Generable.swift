@@ -266,10 +266,7 @@ extension Array: Generable where Element: Generable {
             minItems: nil,
             maxItems: nil
         )
-        return GenerationSchema.primitive(
-            [Element].self,
-            node: .array(arrayNode)
-        )
+        return GenerationSchema(root: .array(arrayNode), defs: elementSchema.defs)
     }
 }
 
