@@ -325,6 +325,73 @@ import Foundation
             /// KV-cache configuration used for generation.
             public var kvCache: KVCache
 
+            /// Configures MLX `GenerateParameters` overrides for a specific generation mode.
+            ///
+            /// Use these values to tune sampling and penalty behavior separately for
+            /// regular and structured generation.
+            public struct GenerationParameters: Codable, Equatable, Sendable {
+                /// Top-p sampling probability threshold.
+                public var topP: Float?
+
+                /// Top-k sampling cutoff.
+                public var topK: Int?
+
+                /// Minimum-p sampling threshold.
+                public var minP: Float?
+
+                /// Repetition penalty applied during sampling.
+                public var repetitionPenalty: Float?
+
+                /// Number of tokens used for repetition-penalty history.
+                public var repetitionContextSize: Int?
+
+                /// Presence penalty applied during sampling.
+                public var presencePenalty: Float?
+
+                /// Number of tokens used for presence-penalty history.
+                public var presenceContextSize: Int?
+
+                /// Frequency penalty applied during sampling.
+                public var frequencyPenalty: Float?
+
+                /// Number of tokens used for frequency-penalty history.
+                public var frequencyContextSize: Int?
+
+                /// Prompt prefill step size.
+                public var prefillStepSize: Int?
+
+                /// Creates MLX generation-parameter overrides.
+                public init(
+                    topP: Float? = nil,
+                    topK: Int? = nil,
+                    minP: Float? = nil,
+                    repetitionPenalty: Float? = nil,
+                    repetitionContextSize: Int? = nil,
+                    presencePenalty: Float? = nil,
+                    presenceContextSize: Int? = nil,
+                    frequencyPenalty: Float? = nil,
+                    frequencyContextSize: Int? = nil,
+                    prefillStepSize: Int? = nil
+                ) {
+                    self.topP = topP
+                    self.topK = topK
+                    self.minP = minP
+                    self.repetitionPenalty = repetitionPenalty
+                    self.repetitionContextSize = repetitionContextSize
+                    self.presencePenalty = presencePenalty
+                    self.presenceContextSize = presenceContextSize
+                    self.frequencyPenalty = frequencyPenalty
+                    self.frequencyContextSize = frequencyContextSize
+                    self.prefillStepSize = prefillStepSize
+                }
+            }
+
+            /// Sampling and penalty overrides used for regular generation.
+            public var regularGeneration: GenerationParameters?
+
+            /// Sampling and penalty overrides used for structured generation.
+            public var structuredGeneration: GenerationParameters?
+
             /// Configures media preprocessing applied before model input.
             public struct UserInputProcessing: Codable, Equatable, Sendable {
                 /// Optional resize target applied to media before tokenization.
@@ -371,14 +438,20 @@ import Foundation
             ///     template rendering context.
             ///   - userInputProcessing: Processing to apply to user media before input preparation.
             ///     Defaults to `nil`, which lets MLX use its default media handling.
+            ///   - regularGeneration: Overrides used for regular generation.
+            ///   - structuredGeneration: Overrides used for structured generation.
             public init(
-                kvCache: KVCache,
-                userInputProcessing: UserInputProcessing?,
-                additionalContext: [String: AnyLanguageModel.JSONValue]?
+                kvCache: KVCache = .default,
+                userInputProcessing: UserInputProcessing? = nil,
+                additionalContext: [String: AnyLanguageModel.JSONValue]? = nil,
+                regularGeneration: GenerationParameters? = nil,
+                structuredGeneration: GenerationParameters? = nil
             ) {
                 self.kvCache = kvCache
                 self.additionalContext = additionalContext
                 self.userInputProcessing = userInputProcessing
+                self.regularGeneration = regularGeneration
+                self.structuredGeneration = structuredGeneration
             }
 
             /// Default MLX generation options used when none are provided at runtime.
@@ -386,7 +459,9 @@ import Foundation
                 .init(
                     kvCache: .default,
                     userInputProcessing: nil,
-                    additionalContext: nil
+                    additionalContext: nil,
+                    regularGeneration: nil,
+                    structuredGeneration: nil
                 )
             }
         }
@@ -1294,34 +1369,59 @@ import Foundation
 
     // MARK: - Options Mapping
 
+    private enum MLXGenerationMode {
+        case regular
+        case structured
+    }
+
     private func toGenerateParameters(_ options: GenerationOptions) -> MLXLMCommon.GenerateParameters {
         let custom = options[custom: MLXLanguageModel.self]
-        return MLXLMCommon.GenerateParameters(
-            maxTokens: options.maximumResponseTokens,
-            maxKVSize: custom?.kvCache.maxSize,
-            kvBits: custom?.kvCache.bits,
-            kvGroupSize: custom?.kvCache.groupSize ?? 64,
-            quantizedKVStart: custom?.kvCache.quantizedStart ?? 0,
-            temperature: Float(options.temperature ?? 0.6),
-            topP: 1.0,
-            repetitionPenalty: nil,
-            repetitionContextSize: 20
+        return toGenerateParameters(
+            options,
+            mode: .regular,
+            overrides: custom?.regularGeneration
         )
     }
 
     /// Builds MLX parameters tuned for structured generation.
     private func toStructuredGenerateParameters(_ options: GenerationOptions) -> MLXLMCommon.GenerateParameters {
         let custom = options[custom: MLXLanguageModel.self]
+        return toGenerateParameters(
+            options,
+            mode: .structured,
+            overrides: custom?.structuredGeneration
+        )
+    }
+
+    private func toGenerateParameters(
+        _ options: GenerationOptions,
+        mode: MLXGenerationMode,
+        overrides: MLXLanguageModel.CustomGenerationOptions.GenerationParameters?
+    ) -> MLXLMCommon.GenerateParameters {
+        // MLX uses shared GenerationOptions only for the cross-model knobs
+        // (temperature and max tokens). Sampling, penalties, and prefill tuning
+        // live in MLX-specific custom options so regular and structured generation
+        // can diverge cleanly.
+        let custom = options[custom: MLXLanguageModel.self]
+        let isStructured = mode == .structured
+
         return MLXLMCommon.GenerateParameters(
             maxTokens: options.maximumResponseTokens,
             maxKVSize: custom?.kvCache.maxSize,
             kvBits: custom?.kvCache.bits,
             kvGroupSize: custom?.kvCache.groupSize ?? 64,
             quantizedKVStart: custom?.kvCache.quantizedStart ?? 0,
-            temperature: Float(options.temperature ?? 0.2),
-            topP: 0.95,
-            repetitionPenalty: 1.1,
-            repetitionContextSize: 64
+            temperature: Float(options.temperature ?? (isStructured ? 0.2 : 0.6)),
+            topP: overrides?.topP ?? (isStructured ? 0.95 : 1.0),
+            topK: overrides?.topK ?? 0,
+            minP: overrides?.minP ?? 0.0,
+            repetitionPenalty: overrides?.repetitionPenalty ?? (isStructured ? 1.1 : nil),
+            repetitionContextSize: overrides?.repetitionContextSize ?? (isStructured ? 64 : 20),
+            presencePenalty: overrides?.presencePenalty,
+            presenceContextSize: overrides?.presenceContextSize ?? 20,
+            frequencyPenalty: overrides?.frequencyPenalty,
+            frequencyContextSize: overrides?.frequencyContextSize ?? 20,
+            prefillStepSize: overrides?.prefillStepSize ?? 512
         )
     }
 
