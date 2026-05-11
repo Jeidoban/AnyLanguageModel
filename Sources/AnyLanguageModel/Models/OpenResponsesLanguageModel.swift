@@ -677,7 +677,7 @@ private enum OpenResponsesAPI {
         }
 
         if type != String.self {
-            let schemaValue = try type.generationSchema.toJSONValueForOpenResponsesStrictMode()
+            let schemaValue = try type.generationSchema.strictStructuredOutputJSONValue()
             body["text"] = .object([
                 "format": .object([
                     "type": .string("json_schema"),
@@ -1147,22 +1147,3 @@ enum OpenResponsesLanguageModelError: LocalizedError, Sendable {
 }
 
 // MARK: - Schema for structured output
-
-private extension GenerationSchema {
-    func toJSONValueForOpenResponsesStrictMode() throws -> JSONValue {
-        let resolved = withResolvedRoot() ?? self
-        let encoder = JSONEncoder()
-        encoder.userInfo[GenerationSchema.omitAdditionalPropertiesKey] = false
-        let data = try encoder.encode(resolved)
-        let jsonSchema = try JSONDecoder().decode(JSONSchema.self, from: data)
-        var value = try JSONValue(jsonSchema)
-        if case .object(var obj) = value {
-            obj["additionalProperties"] = .bool(false)
-            if case .object(let props)? = obj["properties"], !props.isEmpty {
-                obj["required"] = .array(Array(props.keys).sorted().map { .string($0) })
-            }
-            value = .object(obj)
-        }
-        return value
-    }
-}

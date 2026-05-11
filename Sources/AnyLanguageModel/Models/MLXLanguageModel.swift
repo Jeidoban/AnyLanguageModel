@@ -911,10 +911,6 @@ import Foundation
             )
         }
 
-        private func tokens(from input: MLXLMCommon.LMInput) -> [Int32] {
-            input.text.tokens.asArray(Int32.self)
-        }
-
         private func isCacheHit(
             entry: SessionCacheEntry,
             currentTokens: [Int32],
@@ -940,10 +936,15 @@ import Foundation
             session: LanguageModelSession,
             lmInput: MLXLMCommon.LMInput,
             generateParameters: MLXLMCommon.GenerateParameters,
-            context: ModelContext
+            context: ModelContext,
+            promptTokens: [Int32]?
         ) -> (cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32]) {
+            guard let fullTokens = promptTokens else {
+                let newCache = context.model.newCache(parameters: generateParameters)
+                return (newCache, lmInput, [])
+            }
+
             let signature = cacheSignature(from: generateParameters)
-            let fullTokens = tokens(from: lmInput)
             let existingEntry = getSessionCache(for: session)
 
             if let existingEntry,
@@ -1013,6 +1014,34 @@ import Foundation
             )
         }
 
+        private func makeGenerationStream(
+            input: MLXLMCommon.LMInput,
+            cache: [MLXLMCommon.KVCache],
+            parameters: MLXLMCommon.GenerateParameters,
+            context: ModelContext,
+            promptTokens: [Int32]?
+        ) throws -> AsyncStream<MLXLMCommon.Generation> {
+            let processor = parameters.processor().map {
+                PromptSeededLogitProcessor(upstream: $0, promptTokens: promptTokens ?? [])
+            }
+            let iterator = try MLXLMCommon.TokenIterator(
+                input: input,
+                model: context.model,
+                cache: cache,
+                processor: processor,
+                sampler: parameters.sampler(),
+                prefillStepSize: parameters.prefillStepSize,
+                maxTokens: parameters.maxTokens
+            )
+            let (stream, _) = MLXLMCommon.generateTask(
+                promptTokenCount: input.text.tokens.size,
+                modelConfiguration: context.configuration,
+                tokenizer: context.tokenizer,
+                iterator: iterator
+            )
+            return stream
+        }
+
         public func respond<Content>(
             within session: LanguageModelSession,
             to prompt: Prompt,
@@ -1078,19 +1107,28 @@ import Foundation
                     additionalContext: additionalContext
                 )
                 let lmInput = try await context.processor.prepare(input: userInput)
+                let promptTokens = promptTokenIDs(
+                    for: chat,
+                    tools: toolSpecs,
+                    additionalContext: additionalContext,
+                    context: context,
+                    expectedTokenCount: lmInput.text.tokens.size
+                )
                 let resolved = resolveCache(
                     session: session,
                     lmInput: lmInput,
                     generateParameters: generateParameters,
-                    context: context
+                    context: context,
+                    promptTokens: promptTokens
                 )
 
                 // Generate
-                let stream = try MLXLMCommon.generate(
+                let stream = try makeGenerationStream(
                     input: resolved.input,
                     cache: resolved.cache,
                     parameters: generateParameters,
-                    context: context
+                    context: context,
+                    promptTokens: promptTokens
                 )
 
                 var chunks: [String] = []
@@ -1254,18 +1292,27 @@ import Foundation
                             additionalContext: additionalContext
                         )
                         let lmInput = try await context.processor.prepare(input: userInput)
+                        let promptTokens = promptTokenIDs(
+                            for: chat,
+                            tools: nil,
+                            additionalContext: additionalContext,
+                            context: context,
+                            expectedTokenCount: lmInput.text.tokens.size
+                        )
                         let resolved = resolveCache(
                             session: session,
                             lmInput: lmInput,
                             generateParameters: generateParameters,
-                            context: context
+                            context: context,
+                            promptTokens: promptTokens
                         )
 
-                        let mlxStream = try MLXLMCommon.generate(
+                        let mlxStream = try makeGenerationStream(
                             input: resolved.input,
                             cache: resolved.cache,
                             parameters: generateParameters,
-                            context: context
+                            context: context,
+                            promptTokens: promptTokens
                         )
 
                         var accumulatedText = ""
@@ -1353,10 +1400,17 @@ import Foundation
                         tools: toolSpecs
                     )
                     let lmInput = try await context.processor.prepare(input: userInput)
+                    let promptTokens = promptTokenIDs(
+                        for: [.init(role: .system, content: instructions)],
+                        tools: toolSpecs,
+                        additionalContext: nil,
+                        context: context,
+                        expectedTokenCount: lmInput.text.tokens.size
+                    )
                     _ = try context.model.prepare(lmInput, cache: newCache, windowSize: params.prefillStepSize)
                     storeSessionCache(
                         cache: newCache,
-                        fullTokens: tokens(from: lmInput),
+                        fullTokens: promptTokens ?? [],
                         generateParameters: params,
                         session: session
                     )
@@ -1423,6 +1477,76 @@ import Foundation
             frequencyContextSize: overrides?.frequencyContextSize ?? 20,
             prefillStepSize: overrides?.prefillStepSize ?? 512
         )
+    }
+
+    private func promptTokenIDs(
+        for chat: [MLXLMCommon.Chat.Message],
+        tools: [ToolSpec]?,
+        additionalContext: [String: any Sendable]?,
+        context: ModelContext,
+        expectedTokenCount: Int
+    ) -> [Int32]? {
+        guard expectedTokenCount > 0 else { return nil }
+        guard chat.allSatisfy({ $0.images.isEmpty && $0.videos.isEmpty }) else { return nil }
+
+        let tokenizer = context.tokenizer
+        var candidates: [[Int]] = []
+
+        func appendTemplateCandidate(_ messages: [MLXLMCommon.Message]) {
+            if let tokens = try? tokenizer.applyChatTemplate(
+                messages: messages,
+                tools: tools,
+                additionalContext: additionalContext
+            ) {
+                candidates.append(tokens)
+            }
+        }
+
+        let defaultMessages = MLXLMCommon.DefaultMessageGenerator().generate(messages: chat)
+        appendTemplateCandidate(defaultMessages)
+
+        let noSystemMessages = MLXLMCommon.NoSystemMessageGenerator().generate(messages: chat)
+        appendTemplateCandidate(noSystemMessages)
+
+        let contentArrayMessages = chat.map { message -> MLXLMCommon.Message in
+            if message.role == .system {
+                return [
+                    "role": message.role.rawValue,
+                    "content": message.content,
+                ]
+            }
+            return [
+                "role": message.role.rawValue,
+                "content": [
+                    [
+                        "type": "text",
+                        "text": message.content,
+                    ]
+                ],
+            ]
+        }
+        appendTemplateCandidate(contentArrayMessages)
+
+        let noSystemContentArrayMessages = contentArrayMessages.filter {
+            ($0["role"] as? String) != MLXLMCommon.Chat.Message.Role.system.rawValue
+        }
+        appendTemplateCandidate(noSystemContentArrayMessages)
+
+        let defaultFallbackPrompt = defaultMessages.compactMap { $0["content"] as? String }.joined(separator: "\n\n")
+        if !defaultFallbackPrompt.isEmpty {
+            candidates.append(tokenizer.encode(text: defaultFallbackPrompt))
+        }
+
+        let noSystemFallbackPrompt = noSystemMessages.compactMap { $0["content"] as? String }.joined(separator: "\n\n")
+        if !noSystemFallbackPrompt.isEmpty {
+            candidates.append(tokenizer.encode(text: noSystemFallbackPrompt))
+        }
+
+        guard let matchingTokens = candidates.first(where: { $0.count == expectedTokenCount }) else {
+            return nil
+        }
+
+        return matchingTokens.map(Int32.init)
     }
 
     // MARK: - Transcript Conversion
@@ -1824,13 +1948,21 @@ import Foundation
             additionalContext: additionalContext,
         )
         let lmInput = try await context.processor.prepare(input: userInput)
+        let promptTokens = promptTokenIDs(
+            for: chat,
+            tools: nil,
+            additionalContext: additionalContext,
+            context: context,
+            expectedTokenCount: lmInput.text.tokens.size
+        )
 
         let backend = try MLXTokenBackend(
             context: context,
             input: lmInput,
             parameters: generateParameters,
             maximumTokens: maxTokens,
-            endTokens: []
+            endTokens: [],
+            promptTokens: promptTokens
         )
 
         var generator = try ConstrainedJSONGenerator(backend: backend, schema: schema)
@@ -1892,6 +2024,27 @@ import Foundation
         return messages
     }
 
+    private struct PromptSeededLogitProcessor: MLXLMCommon.LogitProcessor {
+        var upstream: any MLXLMCommon.LogitProcessor
+        var promptTokens: [Int32]
+        var didSeedPrompt = false
+
+        mutating func prompt(_ prompt: MLXArray) {
+            guard !didSeedPrompt else { return }
+            didSeedPrompt = true
+            guard !promptTokens.isEmpty else { return }
+            upstream.prompt(MLXArray(promptTokens))
+        }
+
+        func process(logits: MLXArray) -> MLXArray {
+            upstream.process(logits: logits)
+        }
+
+        mutating func didSample(token: MLXArray) {
+            upstream.didSample(token: token)
+        }
+    }
+
     private struct MLXTokenBackend: TokenBackend {
         let model: any MLXLMCommon.LanguageModel
         let tokenizer: any MLXLMCommon.Tokenizer
@@ -1913,7 +2066,8 @@ import Foundation
             input: MLXLMCommon.LMInput,
             parameters: MLXLMCommon.GenerateParameters,
             maximumTokens: Int,
-            endTokens: Set<Int>? = nil
+            endTokens: Set<Int>? = nil,
+            promptTokens: [Int32]? = nil
         ) throws {
             self.model = context.model
             self.tokenizer = context.tokenizer
@@ -1941,7 +2095,9 @@ import Foundation
                 tokenizer: context.tokenizer
             )
 
-            processor?.prompt(input.text.tokens.reshaped(-1))
+            if let promptTokens, !promptTokens.isEmpty {
+                processor?.prompt(MLXArray(promptTokens))
+            }
 
             let prepareResult = try context.model.prepare(
                 input,
